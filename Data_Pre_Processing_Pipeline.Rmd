@@ -1,0 +1,242 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-06-30"
+editor_options: 
+  chunk_output_type: console
+---
+
+---
+title: "Data Preprocessing for Lunbeck Plasma Biomarkers"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(openxlsx)
+library(tidyverse)
+library(dplyr)
+library(naniar)
+library(ggplot2)
+library(patchwork)
+library(readr)
+library(heatmaply)
+library(gtsummary)
+```
+
+
+```{r Get package information}
+pkgs <- c(
+  "openxlsx", "tidyverse", "dplyr", "naniar", "ggplot2", "patchwork",
+  "readr", "heatmaply", "gtsummary", "vtable"
+)
+
+# Get version for each
+pkg_versions <- data.frame(
+  Package = pkgs,
+  Version = sapply(pkgs, function(p) as.character(packageVersion(p))),
+  stringsAsFactors = FALSE
+)
+
+# Print table
+pkg_versions
+```
+
+
+
+```{r load and filter}
+Lunbeck_plasma <- read.xlsx("path of file")
+Lunbeck_plasma <- Lunbeck_plasma %>%
+  filter(Class %in% c("AD", "No cognitive impairment"))
+
+categorical_columns <- c("Gender", "AgeAtVisit", "CognitiveSyndrome", "Diagnosis", "Class", "MMSE_Score")
+Lunbeck_plasma <- Lunbeck_plasma %>%
+  mutate(across(-all_of(categorical_columns), ~ as.numeric(as.character(.))))
+
+if ("Testesterone" %in% colnames(Lunbeck_plasma)) {
+  Lunbeck_plasma$Testosterone <- Lunbeck_plasma$Testesterone
+  Lunbeck_plasma <- Lunbeck_plasma %>% select(-Testesterone)
+}
+```
+
+```{r Summary table}
+
+# summary table
+table1 <-
+  Lunbeck_plasma |> 
+  tbl_summary(include = c(AgeAtVisit,Class, Cerebrospinal.fluids_Amyloid.beta.42.pg.ml, Cerebrospinal.fluids_Phospho.Tau.pg.ml, Cerebrospinal.fluids_Total.Tau.pg.ml), by = Gender)
+  
+
+print(table1)
+```
+
+
+```{r visualize na}
+vis_miss(Lunbeck_plasma) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+heatmaply_na(Lunbeck_plasma, showticklabels = c(TRUE, FALSE))
+```
+
+```{r remove na columns and rows}
+na_proportions <- colMeans(is.na(Lunbeck_plasma))
+columns_to_remove <- which(na_proportions >= 0.25)
+if (length(columns_to_remove) > 0) {
+  Lunbeck_plasma <- Lunbeck_plasma[, -columns_to_remove]
+}
+
+row_na_proportions <- rowMeans(is.na(Lunbeck_plasma))
+rows_to_keep <- which(row_na_proportions <= 0.8)
+Lunbeck_plasma <- Lunbeck_plasma[rows_to_keep, ]
+```
+
+
+
+```{r Feature Engineering}
+safe_ratio <- function(num, den) {
+  ifelse(abs(den) < 1e-8 | is.na(den) | is.na(num), NA, num / den)
+}
+
+add_cortisol_progesterone_ratio <- function(df) {
+  if(all(c("Cortisol", "Progesterone") %in% names(df))) {
+    df$Cortisol_Progesterone_Ratio <- safe_ratio(df$Cortisol, df$Progesterone)
+  }
+  df
+}
+
+add_amyloid_tau_ratio <- function(df) {
+  if(all(c("Cerebrospinal.fluids_Amyloid.beta.42.pg.ml", 
+           "Cerebrospinal.fluids_Phospho.Tau.pg.ml") %in% names(df))) {
+    df$Amyloid_Tau_Ratio <- safe_ratio(
+      df$Cerebrospinal.fluids_Amyloid.beta.42.pg.ml,
+      df$Cerebrospinal.fluids_Phospho.Tau.pg.ml
+    )
+  }
+  df
+}
+
+Lunbeck_plasma <- Lunbeck_plasma %>%
+  add_cortisol_progesterone_ratio() %>%
+  add_amyloid_tau_ratio()
+
+problematic_ratios <- c("Estrone_Testosterone_Ratio", "Testosterone_Estrone_Ratio", "Cortisol_Testosterone_Ratio",
+                        "Progesterone_Testosterone_Ratio", "Aldosterone_Cortisol_Ratio",
+                        "DHT_Testosterone_Ratio", "Cortisol_Aldosterone_Ratio")
+existing_problematic <- intersect(problematic_ratios, names(Lunbeck_plasma))
+if (length(existing_problematic) > 0) {
+  Lunbeck_plasma <- Lunbeck_plasma %>% select(-all_of(existing_problematic))
+}
+
+na_proportions_post <- colMeans(is.na(Lunbeck_plasma))
+columns_to_remove_post <- names(na_proportions_post[na_proportions_post > 0.2])
+if (length(columns_to_remove_post) > 0) {
+  Lunbeck_plasma <- Lunbeck_plasma %>% select(-all_of(columns_to_remove_post))
+}
+```
+
+
+
+```{r Define Density Function}
+plot_density <- function(data, suffix) {
+  plot_list <- list()
+  for (biomarker in selected_biomarkers) {
+    plot_data <- data %>% filter(!is.na(.data[[biomarker]]), !is.na(Gender))
+    biomarker_var <- var(plot_data[[biomarker]], na.rm = TRUE)
+    if (nrow(plot_data) < 2 || is.na(biomarker_var) || biomarker_var == 0) next
+    p <- ggplot(plot_data, aes(x = .data[[biomarker]], fill = Gender)) +
+      geom_density(alpha = 0.5) +
+      labs(title = paste(suffix, biomarker)) +
+      theme_minimal()
+    plot_list <- c(plot_list, list(p))
+  }
+  wrap_plots(plot_list, ncol = 3)
+}
+```
+
+
+
+```{r density-plots}
+set.seed(123)
+exclude_columns <- c("Gender", "AgeAtVisit", "CognitiveSyndrome", "Diagnosis", "Class", "MMSE_Score")
+biomarker_columns <- names(Lunbeck_plasma)[!names(Lunbeck_plasma) %in% exclude_columns]
+biomarker_columns <- biomarker_columns[sapply(Lunbeck_plasma[biomarker_columns], is.numeric)]
+selected_biomarkers <- sample(biomarker_columns, min(9, length(biomarker_columns)))
+
+plot_density(Lunbeck_plasma, "Raw:")
+```
+
+```{r normalization}
+numeric_columns <- setdiff(names(Lunbeck_plasma), categorical_columns)
+Lunbeck_plasma_norm <- Lunbeck_plasma %>%
+  mutate(across(all_of(numeric_columns), ~ as.numeric(scale(log1p(as.numeric(.))))))
+
+plot_density(Lunbeck_plasma_norm, "Normalised:")
+```
+
+
+
+```{r subset-construction}
+set.seed(456)
+molecule_columns <- names(Lunbeck_plasma_norm)
+molecule_columns <- molecule_columns[
+  !grepl("Tau|Amyloid", molecule_columns, ignore.case = TRUE) &
+    !molecule_columns %in% c("Gender", "CognitiveSyndrome", "Diagnosis", "Class", "MMSE_Score", "AgeAtVisit", "Cortisol_Progesterone_Ratio")
+]
+
+phospho_tau_col <- grep("Phospho.Tau", names(Lunbeck_plasma_norm), value = TRUE)
+total_tau_col <- grep("Total.Tau", names(Lunbeck_plasma_norm), value = TRUE)
+amyloid_col <- grep("Amyloid.beta.42", names(Lunbeck_plasma_norm), value = TRUE)
+
+for (i in 1:7) {
+  if (i == 1) {
+    vars <- c("Class", molecule_columns)
+  } else if (i == 2) {
+    vars <- c("Class", "Gender", molecule_columns)
+  } else if (i == 3) {
+    vars <- c("Class", "Gender", "Cortisol_Progesterone_Ratio", molecule_columns)
+  } else if (i == 4) {
+    vars <- c("Class", "Gender", "Cortisol_Progesterone_Ratio", phospho_tau_col, molecule_columns)
+  } else if (i == 5) {
+    vars <- c("Class", "Gender", "Cortisol_Progesterone_Ratio", phospho_tau_col, total_tau_col, molecule_columns)
+  } else if (i == 6) {
+    vars <- c("Class", "Gender", "Cortisol_Progesterone_Ratio", phospho_tau_col, total_tau_col, amyloid_col, molecule_columns)
+  } else if (i == 7) {
+    vars <- c("Class", "Gender", "Cortisol_Progesterone_Ratio", phospho_tau_col, total_tau_col, amyloid_col, "Amyloid_Tau_Ratio", molecule_columns)
+  }
+  
+  vars <- unique(vars[vars %in% names(Lunbeck_plasma_norm)])
+  df <- Lunbeck_plasma_norm %>% select(all_of(vars))
+
+  n_pred <- ncol(df) - 1
+  if (n_pred > 0) {
+    predictor_data <- df[, setdiff(names(df), "Class"), drop = FALSE]
+    missing_count <- rowSums(is.na(predictor_data))
+    df <- df[missing_count < 0.8 * n_pred, ]
+  }
+
+  file_path <- paste0("path of file", i, ".csv")
+  write_csv(df, file_path)
+}
+```
+
+
+
+```{r benchmark-subset}
+set.seed(456)
+benchmark_vars <- c("Class", phospho_tau_col, total_tau_col, amyloid_col)
+benchmark_vars <- unique(benchmark_vars[benchmark_vars %in% names(Lunbeck_plasma_norm)])
+
+if (length(benchmark_vars) >= 2) {
+  benchmark_df <- Lunbeck_plasma_norm %>% select(all_of(benchmark_vars))
+  n_pred <- ncol(benchmark_df) - 1
+  if (n_pred > 0) {
+    predictor_data <- benchmark_df[, setdiff(names(benchmark_df), "Class"), drop = FALSE]
+    missing_count <- rowSums(is.na(predictor_data))
+    benchmark_df <- benchmark_df[missing_count < 0.8 * n_pred, ]
+  }
+  file_path_benchmark <- "path of file"
+  write_csv(benchmark_df, file_path_benchmark)
+}
+
+cat("Script complete. 8 subsets created including benchmark with Tau and Amyloid biomarkers.\n")
+```
+
+
+
