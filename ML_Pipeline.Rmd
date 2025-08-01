@@ -1,0 +1,448 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-06-30"
+editor_options: 
+  chunk_output_type: inline
+---
+
+---
+title: "Final ML Pipeline with Benchmark and SHAP"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r load packages}
+library(tidyverse)
+library(caret)
+library(pROC)
+library(themis)
+library(recipes)
+library(RANN)
+library(vip)
+library(iml)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(kernelshap)
+library(shapviz)
+
+```
+
+```{r Finding version of packages used}
+# Vector of packages used
+pkgs <- c(
+  "tidyverse", "caret", "pROC", "themis", "recipes", "RANN",
+  "vip", "iml", "ggplot2", "patchwork", "dplyr", "tidyr",
+  "stringr", "tibble", "kernelshap", "shapviz"
+)
+
+# Get version for each packge
+pkg_versions <- data.frame(
+  Package = pkgs,
+  Version = sapply(pkgs, function(p) as.character(packageVersion(p))),
+  stringsAsFactors = FALSE
+)
+
+# Print table
+pkg_versions
+
+```
+
+
+
+
+```{r Run Pipeline on All Datasets, message=FALSE, warning=FALSE}
+# Load dataset path
+set.seed(555)
+dataset_paths <- list.files(
+  path = "path to file name",
+  pattern = "^cleaned_Lunbeck_plasma_\\d+\\.csv$",
+  full.names = TRUE
+)
+
+# Load datasets and assign names; Model 1–7
+dataset_list <- setNames(
+  lapply(dataset_paths[1:7], read.csv),
+  paste0("Model ", 1:7)
+)
+
+# Load benchmark 
+benchmark_data <- read.csv(dataset_paths[8])
+
+# Define ML pipeline function
+run_model_pipeline <- function(data, label) {
+  cat("\n===== Running:", label, "=====\n")
+
+  # Filter for binary classification
+  simplified_data <- data %>%
+    filter(Class %in% c("AD", "No cognitive impairment")) %>%
+    mutate(Class = factor(Class, levels = c("AD", "No cognitive impairment"),
+                          labels = c("AD", "No_cognitive_impairment")))
+
+  # Remove rows with all NA (except Class)
+  simplified_data <- simplified_data[rowSums(is.na(simplified_data[, -1])) < ncol(simplified_data) - 1, ]
+
+  # Create folds
+  set.seed(666)
+  folds <- createFolds(simplified_data$Class, k = 5, returnTrain = TRUE)
+  sampling_methods <- c("up", "down", "smote", "rose", "hybrid")
+
+  num_predictors <- ncol(simplified_data) - 1
+  grid_rf <- expand.grid(.mtry = seq(1, num_predictors, by = 5))
+  ntree_values <- c(100, 300, 500, 1000)
+
+  results_tracking <- data.frame()
+
+  for (sampling in sampling_methods) {
+    for (n in ntree_values) {
+      for (m in grid_rf$.mtry) {
+        for (i in seq_along(folds)) {
+          # Split train/test
+          train_indices <- folds[[i]]
+          train_data <- simplified_data[train_indices, ]
+          test_data  <- simplified_data[-train_indices, ]
+
+          # Preprocess (impute, center, scale)
+          pre_proc <- preProcess(train_data, method = c("knnImpute", "center", "scale"))
+          imputed_train <- predict(pre_proc, train_data)
+          imputed_test  <- predict(pre_proc, test_data)
+
+          # Define recipe with dummy and sampling
+          rec <- recipe(Class ~ ., data = imputed_train) %>%
+            step_dummy(all_nominal_predictors()) %>%
+            {
+              if (sampling == "up") step_upsample(., Class)
+              else if (sampling == "down") step_downsample(., Class)
+              else if (sampling == "smote") step_smote(., Class)
+              else if (sampling == "rose") step_rose(., Class)
+              else if (sampling == "hybrid") step_smote(., Class) %>% step_downsample(Class)
+              else .
+            } %>%
+            prep(seed = 123)
+
+          # Create sampled train and prepped test
+          sampled_train <- juice(rec)
+          predictors_test <- bake(rec, new_data = imputed_test)
+
+          # Fit RF model
+          set.seed(789)
+          model <- train(
+            Class ~ ., data = sampled_train,
+            method = "rf",
+            trControl = trainControl(method = "none", classProbs = TRUE, summaryFunction = twoClassSummary),
+            tuneGrid = data.frame(.mtry = m),
+            metric = "ROC",
+            ntree = n
+          )
+
+          # Evaluate on test set
+          probs <- predict(model, newdata = predictors_test, type = "prob")[, "AD"]
+          true_labels <- factor(predictors_test$Class, levels = c("AD", "No_cognitive_impairment"))
+          roc_obj <- suppressWarnings(pROC::roc(true_labels, probs))
+          this_auc <- as.numeric(pROC::auc(roc_obj))
+
+          # Save results
+          results_tracking <- rbind(results_tracking, data.frame(
+            Model = label,
+            Sampling = sampling,
+            ntree = n,
+            mtry = m,
+            AUC = this_auc
+          ))
+        }
+      }
+    }
+  }
+
+  return(results_tracking)
+}
+
+# Run Pipeline on All Datasets 
+results_list <- lapply(names(dataset_list), function(name) {
+  run_model_pipeline(dataset_list[[name]], label = name)
+})
+
+# Run on benchmark
+benchmark_result <- run_model_pipeline(benchmark_data, label = "Benchmark")
+
+# Combine results
+df_all_results <- bind_rows(results_list)
+
+df_combined_results <- bind_rows(
+  df_all_results %>% mutate(Group = "Main"),
+  benchmark_result %>% mutate(Group = "Benchmark")
+)
+
+```
+
+
+
+```{r Bar charts of model outputs}
+
+# Average AUC Across All Models (Grouped Barplot)
+avg_auc <- df_all_results %>%
+  group_by(Model, Sampling) %>%
+  summarise(
+    MeanAUC = mean(AUC, na.rm = TRUE),
+    SDAUC = sd(AUC, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Plot Grouped AUC
+library(ggplot2)
+ggplot(avg_auc, aes(x = Model, y = MeanAUC, fill = Sampling)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+  geom_errorbar(
+    aes(ymin = MeanAUC - SDAUC, ymax = MeanAUC + SDAUC),
+    position = position_dodge(width = 0.9),
+    width = 0.2
+  ) +
+  labs(
+    title = "Mean AUC by Sampling Method and Model",
+    y = "Mean AUC",
+    x = "Model"
+  ) +
+  theme_minimal()
+
+
+
+
+# Combined AUC Plot (Main vs Benchmark)
+df_combined_auc <- df_combined_results %>%
+  group_by(Group, Model, Sampling) %>%
+  summarise(
+    MeanAUC = mean(AUC, na.rm = TRUE),
+    SDAUC = sd(AUC, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Faceted Plot
+library(ggplot2)
+ggplot(df_combined_auc, aes(x = Model, y = MeanAUC, fill = Sampling)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+  geom_errorbar(
+    aes(ymin = MeanAUC - SDAUC, ymax = MeanAUC + SDAUC),
+    position = position_dodge(width = 0.9),
+    width = 0.2
+  ) +
+  facet_wrap(~ Group, scales = "free_x") +
+  labs(title = "Mean AUC by Sampling Method (Main vs Benchmark)",
+       y = "Mean AUC", x = "Model") +
+  theme_minimal()
+
+```
+
+
+
+```{r Making a Table that shows mtry, ntree SD, and AUC}
+best_settings <- df_all_results_with_benchmark %>%
+  group_by(Model, Sampling, ntree, mtry) %>%
+  summarise(
+    mean_auc = mean(AUC, na.rm = TRUE),
+    sd_auc = sd(AUC, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Model, desc(mean_auc)) %>%
+  group_by(Model) %>%
+  slice(1) %>%   
+  ungroup() %>%
+  select(
+    Model,
+    Best_mtry = mtry,
+    Best_ntree = ntree,
+    Best_sampling_technique = Sampling,
+    Best_mean_AUC = mean_auc,     
+    SD_for_best_mean_AUC = sd_auc
+  )
+
+# Compute overall mean and SD AUC per model
+overall_auc_stats <- df_all_results_with_benchmark %>%
+  group_by(Model) %>%
+  summarise(
+    Overall_mean_AUC = mean(AUC, na.rm = TRUE),
+    SD_for_Overall_mean_AUC = sd(AUC, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Join with best_settings
+best_settings_with_overall <- best_settings %>%
+  left_join(overall_auc_stats, by = "Model")
+
+
+# Round numeric columns to 3 decimal places
+best_settings_with_overall <- best_settings_with_overall %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+best_settings_with_overall
+
+# Export to CSV
+write.csv(
+  best_settings_with_overall,
+  file = "Path to file name",
+  row.names = FALSE
+)
+
+
+```
+
+
+
+
+```{r Final Evaluation. Best Model by Mean AUC}
+#  Select best Model from best_settings excluding benchmark
+best_row <- best_settings %>%
+  filter(Model != "Model 0") %>%  
+  arrange(desc(Best_mean_AUC)) %>%
+  slice(1)
+
+best_model_label <- best_row$Model
+best_sampling    <- best_row$Best_sampling_technique
+best_ntree       <- best_row$Best_ntree
+best_mtry        <- best_row$Best_mtry
+
+cat("Best model chosen:", best_model_label, "\n")
+
+# Build final_data from chosen best model 
+final_data <- dataset_list[[best_model_label]] %>%
+  filter(Class %in% c("AD", "No cognitive impairment")) %>%
+  mutate(Class = factor(Class,
+                        levels = c("AD", "No cognitive impairment"),
+                        labels = c("AD", "No_cognitive_impairment")))
+
+# Split Data into 80% Train / 20% Test 
+set.seed(610)
+train_idx <- createDataPartition(final_data$Class, p = 0.8, list = FALSE)
+train_set <- final_data[train_idx, ]
+test_set  <- final_data[-train_idx, ]
+
+# Preprocess Training Data 
+pre_proc <- preProcess(train_set, method = c("knnImpute", "center", "scale"))
+train_set <- predict(pre_proc, train_set)
+test_set  <- predict(pre_proc, test_set)
+
+# Dummy Encode character variables 
+dummy_model <- dummyVars(Class ~ ., data = train_set)
+train_class <- train_set$Class
+test_class  <- test_set$Class
+
+train_set <- predict(dummy_model, newdata = train_set) %>% as.data.frame()
+test_set  <- predict(dummy_model, newdata = test_set) %>% as.data.frame()
+
+train_set$Class <- train_class
+test_set$Class  <- test_class
+
+#  Apply Sampling Recipe 
+rec <- recipe(Class ~ ., data = train_set) %>%
+  {
+    if (best_sampling == "up") step_upsample(., Class)
+    else if (best_sampling == "down") step_downsample(., Class)
+    else if (best_sampling == "smote") step_smote(., Class)
+    else if (best_sampling == "rose") step_rose(., Class)
+    else if (best_sampling == "hybrid") step_smote(., Class) %>% step_downsample(Class)
+    else .
+  } %>%
+  prep(seed = 333)
+
+train_set <- juice(rec)
+
+# Train Final Model
+set.seed(555)
+eval_model <- train(
+  Class ~ ., data = train_set,
+  method = "rf",
+  trControl = trainControl(method = "none", classProbs = TRUE, summaryFunction = twoClassSummary),
+  tuneGrid = data.frame(.mtry = best_mtry),
+  ntree = best_ntree
+)
+
+# Evaluate on Test Set 
+test_probs <- predict(eval_model, newdata = test_set, type = "prob")[, "AD"]
+roc_obj <- pROC::roc(test_set$Class, test_probs)
+
+# Plot ROC Curve
+plot(roc_obj, main = paste("ROC Curve for", best_model_label), col = "blue", lwd = 2)
+auc_val <- round(pROC::auc(roc_obj), 3)
+legend("bottomright", legend = paste("AUC =", auc_val), bty = "n")
+
+cat("\nBest Model:", best_model_label,
+    "\nBest Sampling:", best_sampling,
+    "\nBest ntree:", best_ntree,
+    "\nBest mtry:", best_mtry,
+    "\nFinal AUC on test set:", auc_val, "\n")
+
+
+```
+
+
+```{r SHAP Plot}
+# Compute SHAP values
+set.seed(777)
+shap_values <- kernelshap(
+  object = eval_model,
+  X = train_set %>% select(-Class),  
+  bg_X = train_set %>% select(-Class) %>% slice(1:100),  
+  type = "prob"
+)
+
+#  Create shapviz object for class "AD"
+sv <- shapviz(shap_values)$AD
+
+# Plot full SHAP importance
+sv_importance(sv)                    
+sv_importance(sv, kind = "bee")      
+
+#  After plotting, extract and filter top 10 excluding Tau/Amyloid
+shap_imp <- sv_importance(sv, kind = "bar", return_data = TRUE)
+
+```
+
+
+```{r Filter out features containing Tau and Amyloid}
+# Filter out features containing Tau/Amyloid 
+features_to_remove <- grep("tau|amyloid", colnames(sv$S), ignore.case = TRUE, value = TRUE)
+features_to_keep <- setdiff(colnames(sv$S), features_to_remove)
+
+# Directly modify the shapviz object by sub setting its components
+sv$S <- sv$S[, features_to_keep, drop = FALSE]
+sv$X <- sv$X[, features_to_keep, drop = FALSE]
+sv$featnames <- features_to_keep  
+
+# Plot SHAP importance without Tau/Amyloid 
+sv_importance(sv)                
+sv_importance(sv, kind = "bee")  
+
+
+```
+
+
+
+
+```{r compute global SHAP}
+# Use existing SHAP matrix from shapviz object
+shap_df <- as.data.frame(sv$S)
+
+# Compute global SHAP importance (mean absolute SHAP per feature)
+top10_non_tau <- shap_df %>%
+  summarise(across(everything(), ~ mean(abs(.), na.rm = TRUE))) %>%
+  pivot_longer(cols = everything(), names_to = "feature", values_to = "mean_abs_shap") %>%
+  filter(!str_detect(tolower(feature), "tau|amyloid")) %>%
+  arrange(desc(mean_abs_shap)) %>%
+  slice(1:10)
+
+# Save to CSV
+write.csv(
+  top10_non_tau,
+  "Path to file",
+  row.names = FALSE
+)
+
+# Print result
+print(top10_non_tau)
+
+
+```
+
