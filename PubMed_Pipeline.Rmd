@@ -1,0 +1,305 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-06-24"
+editor_options: 
+  chunk_output_type: console
+---
+
+---
+title: "PubMed Mining for Non-Tau Biomarkers"
+author: "Moritz Ziewer"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r load packages}
+library(easyPubMed)
+library(litsearchr)
+library(stopwords)
+library(igraph)
+library(ggplot2)
+library(ggraph)
+library(ggrepel)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(sentimentr)
+library(grid)
+```
+
+```{r see what version the packages are and make table}
+pkgs <- c(
+  "easyPubMed", "litsearchr", "stopwords", "igraph", "ggplot2", "ggraph",
+  "ggrepel", "dplyr", "tidyr", "stringr", "sentimentr", "tidyr",
+  "grid"
+)
+
+# Get version for each packge
+pkg_versions <- data.frame(
+  Package = pkgs,
+  Version = sapply(pkgs, function(p) as.character(packageVersion(p))),
+  stringsAsFactors = FALSE
+)
+
+# Print table
+pkg_versions
+```
+
+
+
+```{r load biomarkers}
+top_biomarkers_path <- "Path to file"
+if (!file.exists(top_biomarkers_path)) {
+  stop("Top biomarker CSV not found. Please re-run the ML pipeline to generate it.")
+}
+
+top_biomarker_df <- read.csv(top_biomarkers_path)
+
+# Check for the expected "feature" column
+if (!"feature" %in% names(top_biomarker_df)) {
+  stop("CSV must contain a 'feature' column with biomarker names.")
+}
+
+# Extract vector of biomarkers
+top_biomarkers <- top_biomarker_df$feature
+top_biomarkers <- gsub("\\.", " ", top_biomarkers)
+# Replace GenderMale, GenderFemale, or anything starting with "Gender" with just "Gender"
+top_biomarkers <- gsub("^Gender.*", "Gender", top_biomarkers)
+cat("Loaded top biomarkers from CSV:\n")
+print(top_biomarkers)
+
+```
+
+
+
+```{r filter-biomarkers}
+# Get publication counts for each biomarker
+biomarker_counts <- data.frame(
+  Biomarker = top_biomarkers,
+  Count = sapply(top_biomarkers, function(biomarker) {
+    query <- sprintf('Alzheimer\'s Disease AND %s AND ("2000/01/01"[PDAT] : "2025/12/31"[PDAT])', biomarker)
+    pmid_list <- get_pubmed_ids(query)
+    Sys.sleep(1)
+    count <- as.integer(as.character(pmid_list$Count))
+    if (is.na(count)) count <- 0
+    return(count)
+  }),
+  stringsAsFactors = FALSE
+)
+
+# Select top 4 biomarkers by publication count (>10 only)
+biomarkers_for_pubmed <- biomarker_counts %>%
+  filter(Count > 10) %>%
+  arrange(desc(Count)) %>%
+  slice(1:4) %>%
+  pull(Biomarker)
+
+cat("Top 4 biomarkers selected for literature mining:\n")
+print(biomarkers_for_pubmed)
+
+
+if (length(biomarkers_for_pubmed) == 0) {
+  stop("No biomarkers with more than 10 publications found. Adjust filters or check ML output.")
+}
+
+cat("Biomarkers selected for literature mining (PubMed count > 10):\n")
+print(biomarkers_for_pubmed)
+```
+
+
+
+
+```{r Plotting bar chart for number of papers for each biomarker}
+
+biomarker_counts <- lapply(top_biomarkers, function(biomarker) {
+  query <- sprintf('Alzheimer\'s Disease AND %s AND ("2000/01/01"[PDAT] : "2025/12/31"[PDAT])', biomarker)
+  pmid_list <- get_pubmed_ids(query)
+  Sys.sleep(1)  # avoid overloading the server
+  count <- as.integer(as.character(pmid_list$Count))
+  if (is.na(count)) count <- 0
+  return(data.frame(Biomarker = biomarker, Count = count))
+}) %>% bind_rows()
+
+# Bar plot
+ggplot(biomarker_counts, aes(x = reorder(Biomarker, Count), y = Count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  geom_text(aes(label = Count), hjust = -0.1, size = 3) +
+  theme_minimal() +
+  labs(
+    title = "PubMed Publication Count (2000–2025)",
+    subtitle = "Query: Alzheimer's Disease AND Biomarker",
+    x = "Biomarker",
+    y = "Number of Publications"
+  ) +
+  theme(plot.title = element_text(face = "bold"))
+
+```
+
+
+
+```{r pubmed analysis, results='hide', warning=FALSE, message=FALSE}
+years <- 2000:2025
+
+
+for (biomarker in biomarkers_for_pubmed) {
+  cat("\nProcessing biomarker:", biomarker, "\n")
+
+  counts <- sapply(years, function(yr) {
+    query <- sprintf('Alzheimer\'s Disease AND %s AND ("%d/01/01"[PDAT] : "%d/12/31"[PDAT])', biomarker, yr, yr)
+    pmid_list <- get_pubmed_ids(query)
+    Sys.sleep(1)
+    as.integer(as.character(pmid_list$Count))
+  })
+  yearly_counts <- data.frame(year = years, count = counts)
+
+  all_query <- sprintf('Alzheimer\'s Disease AND %s AND ("2000/01/01"[PDAT] : "2025/12/31"[PDAT])', biomarker)
+  all_entrez_id <- get_pubmed_ids(all_query)
+  total_papers <- as.integer(as.character(all_entrez_id$Count))
+
+  # Article selection for high volume biomarkers
+if (total_papers > 1000) {
+  most_recent_year <- max(years)
+  recent_count <- yearly_counts$count[yearly_counts$year == most_recent_year]
+
+  if (!is.na(recent_count) && recent_count >= 200) {
+    # Use only the most recent year
+    selected_years <- most_recent_year
+    cat("Using most recent year only for", biomarker, "due to high article count\n")
+  } else {
+    # Use years with highest count
+    max_count <- max(yearly_counts$count, na.rm = TRUE)
+    year_with_max_count <- yearly_counts$year[yearly_counts$count == max_count]
+    selected_years <- year_with_max_count
+    cat("Using peak publication year(s) for", biomarker, "\n")
+  }
+} else {
+  # For lower-volume terms, use full range
+  selected_years <- years
+}
+
+
+  if (length(selected_years) == 1 && total_papers > 1000) {
+    query <- sprintf('Alzheimer\'s Disease AND %s AND ("%d/01/01"[PDAT] : "%d/12/31"[PDAT])', biomarker, selected_years, selected_years)
+    entrez_id <- get_pubmed_ids(query)
+  } else if (length(selected_years) > 1 && total_papers > 1000) {
+    pmids <- c()
+    for (yr in selected_years) {
+      query <- sprintf('Alzheimer\'s Disease AND %s AND ("%d/01/01"[PDAT] : "%d/12/31"[PDAT])', biomarker, yr, yr)
+      entrez_id_tmp <- get_pubmed_ids(query)
+      pmids <- c(pmids, entrez_id_tmp$IdList)
+      Sys.sleep(1)
+    }
+    pmids <- unique(pmids)
+    entrez_id <- list(IdList = pmids, Count = length(pmids))
+  } else {
+    entrez_id <- all_entrez_id
+  }
+
+  if (is.null(entrez_id) || length(entrez_id$IdList) == 0 || as.integer(as.character(entrez_id$Count)) == 0) {
+    cat("No articles found for", biomarker, "\n")
+    next
+  }
+
+  pmid_subset <- entrez_id$IdList[1:min(200, length(entrez_id$IdList))]
+  pmid_query <- paste(pmid_subset, collapse = " OR ")
+  pmid_query <- paste0("(", pmid_query, ")")
+  subset_entrez_id <- get_pubmed_ids(pmid_query)
+  abstracts_xml <- fetch_pubmed_data(subset_entrez_id, format = "xml")
+  pm_df <- table_articles_byAuth(pubmed_data = abstracts_xml, getKeywords = TRUE)
+
+  relevant_sentences <- c()
+  for (i in seq_len(nrow(pm_df))) {
+    abstract <- pm_df$abstract[i]
+    if (is.na(abstract)) next
+    sentences <- unlist(strsplit(abstract, "(?<=[.!?])\\s+", perl=TRUE))
+    hits <- grep(paste0("(?i)", biomarker), sentences, value = TRUE)
+    hits <- grep("(?i)Alzheimer", hits, value = TRUE)
+    if (length(hits) > 0) {
+      relevant_sentences <- c(relevant_sentences, hits)
+    }
+  }
+
+  if (length(relevant_sentences) > 0) {
+    sentiment_scores <- sentiment(relevant_sentences)
+    sentiment_summary <- table(
+      ifelse(sentiment_scores$sentiment > 0.1, "positive",
+             ifelse(sentiment_scores$sentiment < -0.1, "negative", "neutral"))
+    )
+    cat("Sentiment summary for", biomarker, ":\n")
+    print(sentiment_summary)
+  } else {
+    cat("No relevant sentences found for sentiment analysis for", biomarker, "\n")
+  }
+
+  if (!"keywords" %in% names(pm_df) || all(is.na(pm_df$keywords))) {
+    cat("No keywords found in the articles for", biomarker, "\n")
+    next
+  }
+
+  keywords_long <- pm_df %>%
+    filter(!is.na(keywords)) %>%
+    mutate(keywords = strsplit(keywords, ";")) %>%
+    unnest(keywords) %>%
+    mutate(keywords = str_trim(keywords))
+
+  keyword_counts <- keywords_long %>%
+    group_by(keywords) %>%
+    tally(sort = TRUE, name = "count")
+
+  freq_cutoff <- 5
+  top_keywords <- keyword_counts %>%
+    filter(count >= freq_cutoff) %>%
+    pull(keywords)
+
+  filtered_keywords <- trimws(unlist(strsplit(pm_df$keywords, ";")))
+  filtered_keywords <- filtered_keywords[filtered_keywords %in% top_keywords]
+
+  pm_terms_title <- extract_terms(
+    text = pm_df$title,
+    method = "fakerake", min_freq = 3, min_n = 2,
+    stopwords = stopwords::data_stopwords_stopwordsiso$en
+  )
+  pm_terms_keywords <- extract_terms(
+    keywords = filtered_keywords,
+    method = "tagged", min_freq = 1, min_n = 1, max_n = 5
+  )
+  pm_terms <- unique(c(pm_terms_title, pm_terms_keywords))
+
+  pm_docs <- paste(pm_df$title, pm_df$abstract)
+  pm_dfm <- create_dfm(elements = pm_docs, features = pm_terms)
+  pm_coocnet <- create_network(pm_dfm, min_studies = 3)
+  
+  # Detect clusters using Louvain algorithm
+cl <- cluster_louvain(pm_coocnet)
+V(pm_coocnet)$cluster <- as.factor(membership(cl))
+
+
+ #  filter out low degree nodes to reduce clutter 
+deg <- degree(pm_coocnet)
+pm_coocnet <- delete.vertices(pm_coocnet, which(deg < 3))  
+
+# Plotting Co-Occurence networks
+p <- ggraph(pm_coocnet, layout = "fr") +   
+  geom_edge_link(aes(alpha = weight), show.legend = FALSE) +
+  geom_node_point(aes(color = cluster), size = 3) +
+  geom_node_text(
+    aes(label = ifelse(degree(pm_coocnet) > 4, name, ""), color = cluster),
+    size = 3,
+    repel = TRUE,
+    box.padding = 0.5,
+    point.padding = 0.5,
+    segment.size = 0.2
+  ) +
+  theme_void() +
+  labs(title = paste(biomarker, "Clustered Network (Filtered)")) +
+  theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
+
+
+  plot_filename <- file.path(input_dir, paste0("coocnet_plot_", gsub(" ", "_", tolower(biomarker)), ".png"))
+  ggsave(plot_filename, plot = p, width = 20, height = 16, dpi = 300)
+  print(p)
+}
+```
+
